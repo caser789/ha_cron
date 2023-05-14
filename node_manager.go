@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -14,6 +16,12 @@ import (
 
 type NodeManager interface {
 	IsMaster() bool
+
+	// shard
+	GetAllNodeId() (isMaster bool, nodeIds []string)
+	PubEvent(ctx context.Context, event *Event) error
+
+	GetNodeId() string
 }
 
 var nodeManagerOnce sync.Once
@@ -48,6 +56,7 @@ func NewNodeManager(endpoints []string, nodeKey string) *nodeManager {
 	}
 
 	go n.keepElect()
+	go n.eventLoop()
 	return n
 }
 
@@ -60,6 +69,35 @@ type nodeManager struct {
 	nodeValue string
 
 	closed chan struct{}
+}
+
+func (n *nodeManager) GetNodeId() string {
+	return n.nodeValue
+}
+
+func (n *nodeManager) GetAllNodeId() (isMaster bool, nodeIds []string) {
+	resp, _ := n.cli.Get(context.Background(), n.nodeKey+"/", clientv3.WithPrefix())
+	if resp != nil {
+		nodeIds = make([]string, 0, len(resp.Kvs))
+		for _, kv := range resp.Kvs {
+			nodeIds = append(nodeIds, string(kv.Value))
+		}
+	}
+	if len(nodeIds) > 0 && nodeIds[0] == n.nodeValue {
+		isMaster = true
+	}
+	return
+}
+
+func (n *nodeManager) PubEvent(ctx context.Context, event *Event) error {
+	eventKey := n.nodeKey + "_event"
+	v, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+
+	_, err = n.cli.Put(ctx, eventKey, string(v))
+	return err
 }
 
 func (n *nodeManager) keepElect() {
@@ -92,10 +130,6 @@ func (n *nodeManager) keepElect() {
 			xlogger.GetLogger().Error("[HA]disconnected, re-elect", zap.String("node id", n.GetNodeId()))
 		}
 	}
-}
-
-func (n *nodeManager) GetNodeId() string {
-	return n.nodeValue
 }
 
 func (n *nodeManager) Stop() {

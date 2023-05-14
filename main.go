@@ -3,15 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	xlogger "github.com/caser789/logger"
+	"github.com/robfig/cron"
+	"go.uber.org/zap"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
-
-	xlogger "github.com/caser789/logger"
-	"github.com/robfig/cron"
-	"go.uber.org/zap"
 )
 
 var once sync.Once
@@ -62,6 +60,7 @@ func NewTaskManager(nodeKey string, endpoints []string) *taskManager {
 type cronOption struct {
 	name       string
 	masterOnly bool
+	isSharded  bool
 }
 
 type CronOption func(*cronOption)
@@ -72,11 +71,29 @@ func WithMasterOnly() CronOption {
 	}
 }
 
-func (m *taskManager) Register(spec string, cmd func(ctx context.Context) error, opts ...CronOption) {
+func WithSharedTask() CronOption {
+	return func(option *cronOption) {
+		option.isSharded = true
+		option.masterOnly = true
+	}
+}
+
+type CmdFun func(ctx context.Context, metadata Metadata) error
+
+func (m *taskManager) Register(spec string, fn CmdFun, opts ...CronOption) {
 	defaultTaskName := fmt.Sprintf("task_%d", atomic.AddUint32(&m.taskCount, 1))
 	ops := &cronOption{name: defaultTaskName}
 	for _, f := range opts {
 		f(ops)
+	}
+
+	if ops.isSharded {
+		InitNodeManager(m.endpoints, m.nodeKey)
+		registerShardedTask(fn, ops)
+		m.c.AddFunc(spec, func() {
+			task(triggerTask, ops)
+		})
+		return
 	}
 
 	if ops.masterOnly {
@@ -84,13 +101,16 @@ func (m *taskManager) Register(spec string, cmd func(ctx context.Context) error,
 	}
 
 	_ = m.c.AddFunc(spec, func() {
-		task(cmd, ops)
+		task(fn, ops)
 	})
 }
 
-func task(cmd func(ctx context.Context) error, option *cronOption) {
+func task(fn CmdFun, option *cronOption) {
 	opName := fmt.Sprintf("timer_task_%s", option.name)
 	taskResult := TASK_RESULT_COMPLETED
+
+	ctx := context.Background()
+	ctx = injectCronOption(ctx, option)
 
 	defer func() {
 		if err := recover(); err != nil {
@@ -105,7 +125,7 @@ func task(cmd func(ctx context.Context) error, option *cronOption) {
 	}
 
 	xlogger.GetLogger().Info("start to run task", zap.String("task name", opName))
-	err := cmd(context.Background())
+	err := fn(ctx, Metadata{Partition: 0, TotalPartition: 1})
 	if err != nil {
 		taskResult = TASK_RESULT_ERROR
 		xlogger.GetLogger().Error("run task error", zap.Error(err), zap.String("task name", opName), zap.String("result", taskResult))
@@ -121,10 +141,15 @@ func main() {
 	t := GetTaskManager(nodeKey, strings.Split(endpoints, ","))
 
 	spec := "1 * * * * *"
-	t.Register(spec, func(ctx context.Context) error {
-		fmt.Printf("run task @%s\n", time.Now())
+	t.Register(spec, func(ctx context.Context, metadata Metadata) error {
+		for i := 0; i < 10; i++ {
+			if i%metadata.TotalPartition != metadata.Partition {
+				continue
+			}
+			fmt.Printf("run task %d\n", i)
+		}
 		return nil
-	}, WithMasterOnly())
+	}, WithSharedTask())
 
 	select {}
 	fmt.Println("==================================================")

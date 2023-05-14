@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math/rand"
+	"sync"
 	"time"
 
 	xlogger "github.com/caser789/logger"
@@ -56,22 +59,46 @@ func (n *nodeManager) watchEvent(ctx context.Context) <-chan Event {
 	return eventChan
 }
 
-type Event struct {
-	EventType int    `json:"event_type"`
-	EventId   string `json:"event_id"`
-	//毫秒时间戳
-	CreateTime uint64 `json:"create_time"`
-	Key        string `json:"key"`
-	Value      string `json:"value"`
-}
-
-func (e *Event) String() string {
-	res, _ := json.Marshal(e)
-	return string(res)
-}
-
-type EventProcessor func(*Event) error
-
 var (
-	taskEventProcessor EventProcessor
+	shardedTaskMap  map[string]CmdFun
+	shardedTaskLock sync.Mutex
 )
+
+func init() {
+	shardedTaskMap = make(map[string]CmdFun)
+	taskEventProcessor = processTaskEvent
+}
+
+func registerShardedTask(fn CmdFun, option *cronOption) {
+	shardedTaskLock.Lock()
+	defer shardedTaskLock.Unlock()
+
+	shardedTaskMap[option.name] = fn
+}
+
+func getShardedTask(taskName string) CmdFun {
+	shardedTaskLock.Lock()
+	defer shardedTaskLock.Unlock()
+
+	cmd, ok := shardedTaskMap[taskName]
+	if ok {
+		return cmd
+	}
+	return nil
+}
+
+func triggerTask(ctx context.Context, metadata Metadata) error {
+	option := getCronOption(ctx)
+	shardedTask := new(ShardedTask)
+	shardedTask.TaskName = option.name
+	shardedTask.TaskId = fmt.Sprintf("%d", rand.Int31n(1000000))
+	shardedTask.Partition = make(map[string]int)
+	_, nodeIds := GetNodeManager().GetAllNodeId()
+	for i, nodeId := range nodeIds {
+		shardedTask.Partition[nodeId] = i
+	}
+	event := shardedTask.toEvent()
+	xlogger.GetLogger().Info("before pub event", zap.Any("task", shardedTask))
+	err := GetNodeManager().PubEvent(context.TODO(), event)
+	return err
+}
