@@ -1,6 +1,17 @@
 version: "3.9"
 services:
-  app:
+  app1:
+    build:
+      dockerfile: Dockerfile
+    volumes:
+      - .:/opt/app/api
+      - ./logs/:/logs/
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 100M
+  app2:
     build:
       dockerfile: Dockerfile
     volumes:
