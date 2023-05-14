@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,9 +23,9 @@ const (
 	TASK_RESULT_PANIC     = "panic"
 )
 
-func GetTaskManager() *taskManager {
+func GetTaskManager(nodeKey string, endpoints []string) *taskManager {
 	once.Do(func() {
-		_taskManager = NewTaskManager()
+		_taskManager = NewTaskManager(nodeKey, endpoints)
 	})
 	return _taskManager
 }
@@ -31,6 +33,11 @@ func GetTaskManager() *taskManager {
 type taskManager struct {
 	c         *cron.Cron
 	taskCount uint32
+
+	nodeKey   string
+	endpoints []string
+
+	once sync.Once
 }
 
 func init() {
@@ -41,24 +48,42 @@ func init() {
 	})
 }
 
-func NewTaskManager() *taskManager {
+func NewTaskManager(nodeKey string, endpoints []string) *taskManager {
 	c := cron.New()
 	c.Start()
 
 	return &taskManager{
-		c: c,
+		c:         c,
+		nodeKey:   nodeKey,
+		endpoints: endpoints,
 	}
 }
 
 type cronOption struct {
-	name string
+	name       string
+	masterOnly bool
 }
 
-func (m *taskManager) Register(spec string, cmd func(ctx context.Context) error) {
+type CronOption func(*cronOption)
+
+func WithMasterOnly() CronOption {
+	return func(option *cronOption) {
+		option.masterOnly = true
+	}
+}
+
+func (m *taskManager) Register(spec string, cmd func(ctx context.Context) error, opts ...CronOption) {
 	defaultTaskName := fmt.Sprintf("task_%d", atomic.AddUint32(&m.taskCount, 1))
 	ops := &cronOption{name: defaultTaskName}
+	for _, f := range opts {
+		f(ops)
+	}
 
-	m.c.AddFunc(spec, func() {
+	if ops.masterOnly {
+		InitNodeManager(m.endpoints, m.nodeKey)
+	}
+
+	_ = m.c.AddFunc(spec, func() {
 		task(cmd, ops)
 	})
 }
@@ -74,26 +99,32 @@ func task(cmd func(ctx context.Context) error, option *cronOption) {
 		}
 	}()
 
-	xlogger.GetLogger().Info("start to run task", zap.String("task name", opName))
+	if option.masterOnly && !GetNodeManager().IsMaster() {
+		xlogger.GetLogger().Info("skip for not leader", zap.String("task name", opName))
+		return
+	}
 
+	xlogger.GetLogger().Info("start to run task", zap.String("task name", opName))
 	err := cmd(context.Background())
 	if err != nil {
 		taskResult = TASK_RESULT_ERROR
 		xlogger.GetLogger().Error("run task error", zap.Error(err), zap.String("task name", opName), zap.String("result", taskResult))
 	}
-
 	xlogger.GetLogger().Info("complete to run task", zap.String("task name", opName), zap.String("result", taskResult))
 }
 
 func main() {
 	fmt.Println("--------------------------------------------------")
-	t := GetTaskManager()
+	nodeKey := os.Getenv("NODE_KEY")
+	endpoints := os.Getenv("ENDPOINTS")
+
+	t := GetTaskManager(nodeKey, strings.Split(endpoints, ","))
 
 	spec := "1 * * * * *"
 	t.Register(spec, func(ctx context.Context) error {
 		fmt.Printf("run task @%s\n", time.Now())
 		return nil
-	})
+	}, WithMasterOnly())
 
 	select {}
 	fmt.Println("==================================================")
